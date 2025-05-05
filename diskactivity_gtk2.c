@@ -1,13 +1,12 @@
 #include <gtk/gtk.h>
-#include <stdio.h>
+#include <gdk-pixbuf/gdk-pixbuf.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
+#include <fcntl.h>
 #include <unistd.h>
+#include "disk_icons.h"
 
-#define ICON_ACTIVITY "/usr/share/pixmaps/driveact.png"
-#define ICON_NO_ACTIVITY "/usr/share/pixmaps/drivenoact.png"
-#define ICON_WINDOW "/usr/share/pixmaps/diskact.png"
 #define WINDOW_WIDTH 165
 #define WINDOW_HEIGHT 180
 #define CHECK_INTERVAL 400
@@ -15,8 +14,8 @@
 
 typedef struct {
     GtkStatusIcon *status_icon;
-    unsigned long prev_sectors_read;
-    unsigned long prev_sectors_written;
+    uint32_t prev_sectors_read;
+    uint32_t prev_sectors_written;
     gboolean current_state;
     GtkWidget *window;
     GtkWidget *dirty_label;
@@ -24,79 +23,160 @@ typedef struct {
     guint update_timeout;
 } DiskData;
 
+// --- Icônes embarquées ---
+static GdkPixbuf *pixbuf_activity = NULL;
+static GdkPixbuf *pixbuf_no_activity = NULL;
+static GdkPixbuf *pixbuf_window = NULL;
+
+// --- Structure statique ---
+static DiskData disk_data = {0};
+
+// --- Buffers statiques globaux ---
+static char diskstats_buf[4096];
+static char meminfo_buf[512];
+
+// --- Macros utilitaires ---
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#define STR_EQ2(a,b) (*(uint16_t*)(a)==*(uint16_t*)(b))
+
+// --- Utilitaire : pixbuf depuis données mémoire ---
+static inline GdkPixbuf* pixbuf_from_data(const unsigned char *data, size_t size) {
+    GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
+    gdk_pixbuf_loader_write(loader, data, size, NULL);
+    gdk_pixbuf_loader_close(loader, NULL);
+    GdkPixbuf *pixbuf = gdk_pixbuf_loader_get_pixbuf(loader);
+    if (pixbuf) g_object_ref(pixbuf);
+    g_object_unref(loader);
+    return pixbuf;
+}
+
+// --- Parsing manuel de /proc/diskstats ---
+static inline void parse_diskstats(uint32_t *rsect, uint32_t *wsect) {
+    int fd = open("/proc/diskstats", O_RDONLY);
+    *rsect = 0; *wsect = 0;
+    if (unlikely(fd < 0)) return;
+    ssize_t len = read(fd, diskstats_buf, sizeof(diskstats_buf)-1);
+    close(fd);
+    if (unlikely(len <= 0)) return;
+    diskstats_buf[len] = 0;
+    char *p = diskstats_buf;
+    while (*p) {
+        // Major
+        while (*p == ' ') ++p;
+        unsigned int major = 0;
+        while (*p >= '0' && *p <= '9') major = major*10 + (*p++ - '0');
+        while (*p == ' ') ++p;
+        // Minor
+        unsigned int minor = 0;
+        while (*p >= '0' && *p <= '9') minor = minor*10 + (*p++ - '0');
+        while (*p == ' ') ++p;
+        // Dev name
+        char dev[12]; int i=0;
+        while (*p && *p != ' ' && i<11) dev[i++] = *p++;
+        dev[i]=0;
+        while (*p == ' ') ++p;
+        // Skip 2 fields
+        for (int j=0;j<2;++j) { while (*p && *p!=' ') ++p; while (*p==' ') ++p; }
+        // rsect
+        uint32_t r = 0;
+        while (*p >= '0' && *p <= '9') r = r*10 + (*p++ - '0');
+        while (*p == ' ') ++p;
+        // Skip 1 field
+        while (*p && *p!=' ') ++p; while (*p==' ') ++p;
+        // wsect
+        uint32_t w = 0;
+        while (*p >= '0' && *p <= '9') w = w*10 + (*p++ - '0');
+        // Match disque principal (multi-disque)
+        if ((dev[0]=='s'&&dev[1]=='d'&&minor%16==0) ||
+            (dev[0]=='h'&&dev[1]=='d'&&minor%64==0) ||
+            (!strncmp(dev,"nvme",4)&&!strstr(dev,"p")) ||
+            (!strncmp(dev,"mmcblk",6)&&!strstr(dev,"p")) ||
+            (dev[0]=='m'&&dev[1]=='d') ||
+            (!strncmp(dev,"pmem",4)&&!strstr(dev,"p"))) {
+            *rsect += r;
+            *wsect += w;
+        }
+        p = strchr(p, '\n');
+        if (!p) break;
+        ++p;
+    }
+}
+
+// --- Parsing manuel de /proc/meminfo ---
+static inline void parse_dirty_writeback(uint32_t *dirty, uint32_t *writeback) {
+    int fd = open("/proc/meminfo", O_RDONLY);
+    *dirty=0; *writeback=0;
+    if (unlikely(fd < 0)) return;
+    ssize_t len = read(fd, meminfo_buf, sizeof(meminfo_buf)-1);
+    close(fd);
+    if (unlikely(len <= 0)) return;
+    meminfo_buf[len]=0;
+    char *p = meminfo_buf;
+    while (*p) {
+        if (!strncmp(p,"Dirty:",6)) *dirty = (uint32_t)atoi(p+6);
+        else if (!strncmp(p,"Writeback:",9)) *writeback = (uint32_t)atoi(p+9);
+        p = strchr(p,'\n'); if (!p) break; ++p;
+    }
+}
+
+// --- Fonctions prototypes ---
 static void on_quit_activate(GtkMenuItem *item, gpointer user_data);
-static void on_status_icon_popup(GtkStatusIcon *status_icon, guint button,
-                                 guint activate_time, gpointer user_data);
+static void on_status_icon_popup(GtkStatusIcon *status_icon, guint button, guint activate_time, gpointer user_data);
 gboolean check_disk_activity(gpointer user_data);
 gboolean update_dirty_writecache(gpointer user_data);
 void show_dirty_writecache_window(GtkMenuItem *item, gpointer user_data);
 static void on_close_button_clicked(GtkWidget *widget, gpointer user_data);
 static void on_sync_button_clicked(GtkWidget *widget, gpointer user_data);
+static void on_window_destroy(GtkWidget *widget, gpointer user_data);
+static void position_window_bottom_right(GtkWidget *window);
 
-char* format_with_thousands_separator(unsigned long value) {
-    static char formatted[32];
-    char temp[32];
-    int i, j, k;
-    snprintf(temp, sizeof(temp), "%lu", value);
-    int len = strlen(temp);
-    for (i = 0, j = 0, k = len % 3 ? len % 3 : 3; i < len; i++, k--) {
-        formatted[j++] = temp[i];
-        if (k == 0 && i < len - 1) {
-            formatted[j++] = ' ';
-            k = 3;
-        }
-    }
-    formatted[j] = '\0';
-    return formatted;
-}
-
-
+// --- Fonctions principales ---
 gboolean check_disk_activity(gpointer user_data) {
     DiskData *disk_data = (DiskData *)user_data;
-    FILE *fp = fopen("/proc/diskstats", "r");
-    if (!fp) return TRUE;
-    char line[128];
-    unsigned long total_sectors_read = 0, total_sectors_written = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        unsigned int major, minor;
-        char dev_name[16];
-        unsigned long rsect, wsect;
-        if (sscanf(line, "%u %u %15s %*u %*u %lu %*u %*u %*u %lu",
-                   &major, &minor, dev_name, &rsect, &wsect) == 5) {
-            if (
-                ((strncmp(dev_name, "sd", 2) == 0 || strncmp(dev_name, "hd", 2) == 0) && minor % 16 == 0) ||
-                (strncmp(dev_name, "nvme", 4) == 0 && strstr(dev_name, "p") == NULL) ||
-                (strncmp(dev_name, "mmcblk", 6) == 0 && strstr(dev_name, "p") == NULL) ||
-                (strncmp(dev_name, "md", 2) == 0) ||
-                (strncmp(dev_name, "pmem", 4) == 0 && strstr(dev_name, "p") == NULL)
-            ) {
-                total_sectors_read += rsect;
-                total_sectors_written += wsect;
-            }
-        }
-    }
-    fclose(fp);
+    uint32_t total_sectors_read = 0, total_sectors_written = 0;
+    parse_diskstats(&total_sectors_read, &total_sectors_written);
     gboolean activity = (total_sectors_read > disk_data->prev_sectors_read ||
                          total_sectors_written > disk_data->prev_sectors_written);
     if (activity != disk_data->current_state) {
         disk_data->current_state = activity;
-        gtk_status_icon_set_from_file(disk_data->status_icon,
-                                      activity ? ICON_ACTIVITY : ICON_NO_ACTIVITY);
+        gtk_status_icon_set_from_pixbuf(disk_data->status_icon,
+            activity ? pixbuf_activity : pixbuf_no_activity);
     }
     disk_data->prev_sectors_read = total_sectors_read;
     disk_data->prev_sectors_written = total_sectors_written;
     return TRUE;
 }
 
-static void on_quit_activate(GtkMenuItem *item, gpointer user_data) {
+gboolean update_dirty_writecache(gpointer user_data) {
     DiskData *disk_data = (DiskData *)user_data;
-    if (disk_data->window) {
-        gtk_widget_destroy(disk_data->window);
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return FALSE;
+    char line[96];
+    uint32_t dirty = 0, writeback = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (!dirty && strncmp(line, "Dirty:", 6) == 0) {
+            dirty = (uint32_t)strtoul(line + 6, NULL, 10);
+        } else if (!writeback && strncmp(line, "Writeback:", 9) == 0) {
+            writeback = (uint32_t)strtoul(line + 9, NULL, 10);
+        }
+        if (dirty && writeback) break;
     }
-    g_slice_free(DiskData, user_data);
-    gtk_main_quit();
+    fclose(fp);
+    char dirty_text[32], writecache_text[32];
+    snprintf(dirty_text, sizeof(dirty_text), "%u", dirty);
+    snprintf(writecache_text, sizeof(writecache_text), "%u", writeback);
+    gtk_label_set_text(GTK_LABEL(disk_data->dirty_label), dirty_text);
+    gtk_label_set_text(GTK_LABEL(disk_data->writecache_label), writecache_text);
+    return TRUE;
 }
 
+
+static void on_quit_activate(GtkMenuItem *item, gpointer user_data) {
+    DiskData *disk_data = (DiskData *)user_data;
+    if (disk_data->window) gtk_widget_destroy(disk_data->window);
+    gtk_main_quit();
+}
 
 static void on_status_icon_popup(GtkStatusIcon *status_icon, guint button,
                                  guint activate_time, gpointer user_data) {
@@ -113,30 +193,15 @@ static void on_status_icon_popup(GtkStatusIcon *status_icon, guint button,
                    button, activate_time);
 }
 
-
-gboolean update_dirty_writecache(gpointer user_data) {
+static void on_close_button_clicked(GtkWidget *widget, gpointer user_data) {
     DiskData *disk_data = (DiskData *)user_data;
-    FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return FALSE;
-    char line[128];
-    unsigned long dirty = 0, writeback = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (sscanf(line, "Dirty: %lu", &dirty) == 1) {
-            continue;
-        }
-        if (sscanf(line, "Writeback: %lu", &writeback) == 1) {
-            continue;
-        }
-    }
-    fclose(fp);
-    char dirty_text[64], writecache_text[64];
-    snprintf(dirty_text, sizeof(dirty_text), "%lu", dirty);
-    snprintf(writecache_text, sizeof(writecache_text), "%lu", writeback);
-    gtk_label_set_text(GTK_LABEL(disk_data->dirty_label), dirty_text);
-    gtk_label_set_text(GTK_LABEL(disk_data->writecache_label), writecache_text);
-    return TRUE;
+    if (disk_data->window) gtk_widget_destroy(disk_data->window);
 }
 
+static void on_sync_button_clicked(GtkWidget *widget, gpointer user_data) {
+    (void)widget; (void)user_data;
+    sync();
+}
 
 static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
     DiskData *disk_data = (DiskData *)user_data;
@@ -146,17 +211,6 @@ static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
     }
     disk_data->window = NULL;
 }
-
-
-static void on_close_button_clicked(GtkWidget *widget, gpointer user_data) {
-    DiskData *disk_data = (DiskData *)user_data;
-    gtk_widget_destroy(disk_data->window);
-}
-
-static void on_sync_button_clicked(GtkWidget *widget, gpointer user_data) {
-    system("sync");
-}
-
 
 static void position_window_bottom_right(GtkWidget *window) {
     GdkDisplay *display = gdk_display_get_default();
@@ -173,8 +227,6 @@ static void position_window_bottom_right(GtkWidget *window) {
     gtk_window_move(GTK_WINDOW(window), x_pos, y_pos);
 }
 
-
-
 void show_dirty_writecache_window(GtkMenuItem *item, gpointer user_data) {
     DiskData *disk_data = (DiskData *)user_data;
     if (!disk_data->window) {
@@ -183,41 +235,47 @@ void show_dirty_writecache_window(GtkMenuItem *item, gpointer user_data) {
         gtk_window_set_default_size(GTK_WINDOW(disk_data->window), WINDOW_WIDTH, WINDOW_HEIGHT);
         gtk_window_set_resizable(GTK_WINDOW(disk_data->window), FALSE);
         gtk_window_set_position(GTK_WINDOW(disk_data->window), GTK_WIN_POS_NONE);
-        gtk_window_set_decorated(GTK_WINDOW(disk_data->window), FALSE);
+        gtk_window_set_decorated(GTK_WINDOW(disk_data->window), TRUE);
         gtk_window_set_keep_above(GTK_WINDOW(disk_data->window), TRUE);
-        gtk_window_set_icon_from_file(GTK_WINDOW(disk_data->window), ICON_WINDOW, NULL);
+        gtk_window_set_icon(GTK_WINDOW(disk_data->window), pixbuf_window);
+
         GtkWidget *vbox = gtk_vbox_new(FALSE, 5);
         gtk_container_add(GTK_CONTAINER(disk_data->window), vbox);
         gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+
         GtkWidget *dirty_frame = gtk_frame_new("Dirty");
         GtkWidget *writecache_frame = gtk_frame_new("Writeback");
         disk_data->dirty_label = gtk_label_new("");
         disk_data->writecache_label = gtk_label_new(" ");
-        gtk_widget_set_size_request(dirty_frame, WINDOW_WIDTH - 20, -1); // -20 pour les marges
+        gtk_widget_set_size_request(dirty_frame, WINDOW_WIDTH - 20, -1);
         gtk_widget_set_size_request(writecache_frame, WINDOW_WIDTH - 20, -1);
         gtk_misc_set_alignment(GTK_MISC(disk_data->dirty_label), 0.5, 0.5);
         gtk_misc_set_alignment(GTK_MISC(disk_data->writecache_label), 0.5, 0.5);
+
         PangoAttrList *attr_list = pango_attr_list_new();
-        PangoAttribute *attr_weight = pango_attr_weight_new(PANGO_WEIGHT_BOLD);
-        PangoAttribute *attr_size = pango_attr_size_new(16 * PANGO_SCALE);
-        pango_attr_list_insert(attr_list, attr_weight);
-        pango_attr_list_insert(attr_list, attr_size);
+        pango_attr_list_insert(attr_list, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        pango_attr_list_insert(attr_list, pango_attr_size_new(16 * PANGO_SCALE));
         gtk_label_set_attributes(GTK_LABEL(disk_data->dirty_label), attr_list);
         gtk_label_set_attributes(GTK_LABEL(disk_data->writecache_label), attr_list);
         pango_attr_list_unref(attr_list);
+
         gtk_container_add(GTK_CONTAINER(dirty_frame), disk_data->dirty_label);
         gtk_container_add(GTK_CONTAINER(writecache_frame), disk_data->writecache_label);
+
         GtkWidget *sync_button = gtk_button_new_with_label("Sync");
         GtkWidget *close_button = gtk_button_new_with_label("Close");
         gtk_widget_set_size_request(sync_button, WINDOW_WIDTH - 20, -1);
         gtk_widget_set_size_request(close_button, WINDOW_WIDTH - 20, -1);
         g_signal_connect(G_OBJECT(sync_button), "clicked", G_CALLBACK(on_sync_button_clicked), NULL);
         g_signal_connect(G_OBJECT(close_button), "clicked", G_CALLBACK(on_close_button_clicked), disk_data);
+
         gtk_box_pack_start(GTK_BOX(vbox), dirty_frame, TRUE, TRUE, 0);
         gtk_box_pack_start(GTK_BOX(vbox), writecache_frame, TRUE, TRUE, 0);
         gtk_box_pack_start(GTK_BOX(vbox), sync_button, TRUE, TRUE, 0);
         gtk_box_pack_start(GTK_BOX(vbox), close_button, TRUE, TRUE, 0);
+
         g_signal_connect(G_OBJECT(disk_data->window), "destroy", G_CALLBACK(on_window_destroy), disk_data);
+
         gtk_widget_show_all(disk_data->window);
         position_window_bottom_right(disk_data->window);
         disk_data->update_timeout = g_timeout_add(UPDATE_INTERVAL, update_dirty_writecache, disk_data);
@@ -227,29 +285,36 @@ void show_dirty_writecache_window(GtkMenuItem *item, gpointer user_data) {
     }
 }
 
-
-
 int main(int argc, char *argv[]) {
     gtk_init(&argc, &argv);
-    if (access(ICON_ACTIVITY, F_OK) == -1 || access(ICON_NO_ACTIVITY, F_OK) == -1) {
-        fprintf(stderr, "icons missing\n");
-        return 1;
-    }
-    DiskData *disk_data = g_slice_new0(DiskData);
-    disk_data->prev_sectors_read = 0;
-    disk_data->prev_sectors_written = 0;
-    disk_data->current_state = FALSE;
-    disk_data->window = NULL;
-    disk_data->status_icon = gtk_status_icon_new();
-    gtk_status_icon_set_from_file(disk_data->status_icon, ICON_NO_ACTIVITY);
-    gtk_status_icon_set_tooltip(disk_data->status_icon, "Disk activity");
-    gtk_status_icon_set_visible(disk_data->status_icon, TRUE);
-    g_signal_connect(G_OBJECT(disk_data->status_icon), "popup-menu",
-                     G_CALLBACK(on_status_icon_popup), disk_data);
-    g_signal_connect(G_OBJECT(disk_data->status_icon), "activate",
-                     G_CALLBACK(show_dirty_writecache_window), disk_data);
-    g_timeout_add(CHECK_INTERVAL, check_disk_activity, disk_data);
+
+    // Initialisation des pixbufs embarqués
+    pixbuf_activity = pixbuf_from_data(driveact_data, driveact_size);
+    pixbuf_no_activity = pixbuf_from_data(drivenoact_data, drivenoact_size);
+    pixbuf_window = pixbuf_from_data(diskact_data, diskact_size);
+
+    disk_data.prev_sectors_read = 0;
+    disk_data.prev_sectors_written = 0;
+    disk_data.current_state = FALSE;
+    disk_data.window = NULL;
+    disk_data.status_icon = gtk_status_icon_new();
+    gtk_status_icon_set_from_pixbuf(disk_data.status_icon, pixbuf_no_activity);
+    gtk_status_icon_set_tooltip(disk_data.status_icon, "Disk activity");
+    gtk_status_icon_set_visible(disk_data.status_icon, TRUE);
+
+    g_signal_connect(G_OBJECT(disk_data.status_icon), "popup-menu",
+                     G_CALLBACK(on_status_icon_popup), &disk_data);
+    g_signal_connect(G_OBJECT(disk_data.status_icon), "activate",
+                     G_CALLBACK(show_dirty_writecache_window), &disk_data);
+
+    g_timeout_add(CHECK_INTERVAL, check_disk_activity, &disk_data);
+
     gtk_main();
+
+    // Libération mémoire
+    g_object_unref(pixbuf_activity);
+    g_object_unref(pixbuf_no_activity);
+    g_object_unref(pixbuf_window);
+
     return 0;
 }
-
