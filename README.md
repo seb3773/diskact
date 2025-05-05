@@ -26,14 +26,7 @@ This app was originally written for my q4rescue live system project based on q4o
 
 --> Compiling binary:
 
-gtk3:
+make
 
-gcc -O2  -fstrict-aliasing -flto -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -fomit-frame-pointer -ffast-math -fvisibility=hidden -fuse-ld=gold -Wl,--gc-sections,--build-id=none,-O1 -s -o diskactivity_gtk3 diskactivity_gtk3.c `pkg-config --cflags --libs gtk+-3.0`
+(use provided MakeFile)
 
-gtk2:
-
-gcc -O2 -fstrict-aliasing -flto -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -fomit-frame-pointer -ffast-math -fvisibility=hidden -fuse-ld=gold -Wl,--gc-sections,--build-id=none,-O1 -s -o diskactivity_gtk2 diskactivity_gtk2.c `pkg-config --cflags --libs gtk+-2.0`
-
-Don't forget to copy the icons (driveact.png, drivenoact.png and diskact.png) in the folder /usr/share/pixmaps/  (create it if it doesn't exist).
-
-** Licence : WTFYW     ;-)
